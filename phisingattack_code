@@ -1,0 +1,354 @@
+#step 1 import libraries 
+
+import os
+import warnings
+warnings.filterwarnings("ignore") 
+
+import numpy as np
+import pandas as pd
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from typing import List, Tuple, Dict, Optional
+
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_validate
+from sklearn.preprocessing import StandardScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    roc_auc_score, confusion_matrix, classification_report, RocCurveDisplay
+)
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+
+RANDOM_STATE = 42
+sns.set(style="whitegrid", context="notebook")
+plt.rcParams["figure.figsize"] = (8, 4)
+
+
+
+#step 2 - load dataset 
+
+
+def safe_read_csv(path: str) -> pd.DataFrame:
+    """Read a CSV robustly with common options for large files."""
+    assert os.path.exists(path), f"File not found: {path}"
+    df = pd.read_csv(path, low_memory=False)
+    return df
+
+CSV_PATH = "/content/drive/MyDrive/Phising_dataset_predict.csv"  # change if your path differs
+df_raw = safe_read_csv(CSV_PATH)
+
+print("✅ Loaded CSV successfully.")
+print(f"Shape (rows, cols): {df_raw.shape}")
+print("\nFirst 5 rows:")
+display(df_raw.head())
+
+print("\nColumn dtypes:")
+print(df_raw.dtypes)
+
+print("\nBasic description (numeric):")
+display(df_raw.describe())
+
+print("\nMemory usage (MB):", round(df_raw.memory_usage(deep=True).sum() / 1e6, 2))
+
+
+#step 3 - duplicates and null values 
+
+
+print("\n➤ Duplicate rows:", df_raw.duplicated().sum())
+
+print("\n➤ Missing values per column:")
+missing_counts = df_raw.isnull().sum().sort_values(ascending=False)
+display(missing_counts[missing_counts > 0])
+
+# Visualize missing values (Heatmap & Bar) — works well for <= ~100 columns
+plt.figure(figsize=(10, 5))
+sns.heatmap(df_raw.isnull(), cbar=False, yticklabels=False, cmap="viridis")
+plt.title("Missing Values Heatmap (All Columns)")
+plt.show()
+
+if (missing_counts > 0).any():
+    plt.figure(figsize=(10, 4))
+    missing_counts[missing_counts > 0].plot(kind="bar", color="#ff9800")
+    plt.title("Missing Values per Column (Bar Chart)")
+    plt.ylabel("Count of Missing")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.show()
+
+
+#step 4 - visualize null values 
+
+
+plt.figure(figsize=(10, 5))
+sns.heatmap(df_raw.isnull(), cbar=False, yticklabels=False, cmap="viridis")
+plt.title("Missing Values Heatmap (All Columns)")
+plt.show()
+
+if (missing_counts > 0).any():
+    plt.figure(figsize=(10, 4))
+    missing_counts[missing_counts > 0].plot(kind="bar", color="#ff9800")
+    plt.title("Missing Values per Column (Bar Chart)")
+    plt.ylabel("Count of Missing")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.show()
+
+#step 5 - data description
+
+
+
+print("\n➤ Column names:")
+print(list(df_raw.columns))
+
+print("\n➤ Quick unique counts (first 10 columns):")
+for col in df_raw.columns[:10]:
+    try:
+        print(f"  - {col}: {df_raw[col].nunique()} unique")
+    except Exception as e:
+        print(f"  - {col}: (unique count failed) -> {e}")
+
+print("\nℹ️ Tip: In this dataset, features look numeric (counts/lengths), \
+and the target column is likely 'Phising' (0/1).")
+
+
+#step 6 - data wrangling 
+
+df = df_raw.copy()
+
+# 4.1 Drop obvious auto-index / useless columns (if present)
+for junk in ["Unnamed: 0", "index"]:
+    if junk in df.columns:
+        df.drop(columns=[junk], inplace=True)
+
+# 4.2 Identify target column
+TARGET_CANDIDATES = ["Phishing", "phishing", "is_phishing", "label", "target", "Phising"]  # includes misspelling
+target_col = None
+for cand in TARGET_CANDIDATES:
+    if cand in df.columns:
+        target_col = cand
+        break
+
+assert target_col is not None, "❌ Could not find a target label column. Please set 'target_col' manually."
+
+print(f"\n✅ Using target column: '{target_col}'")
+
+# 4.3 Handle missing target labels — safest is to drop them
+missing_target = df[target_col].isna().sum()
+if missing_target > 0:
+    print(f"⚠️ Dropping {missing_target} rows with missing target labels.")
+    df = df[~df[target_col].isna()].copy()
+
+# 4.4 Convert target to integer (0/1) if float
+if df[target_col].dtype.kind in ("f", "O"):
+    # Many phishing datasets have 0.0 / 1.0 floats; cast safely.
+    df[target_col] = df[target_col].astype(float).round().astype(int)
+
+# 4.5 Separate features & target
+X = df.drop(columns=[target_col])
+y = df[target_col]
+
+# 4.6 Numeric vs Categorical split (here, most are numeric)
+num_cols = [c for c in X.columns if np.issubdtype(X[c].dtype, np.number)]
+cat_cols = [c for c in X.columns if c not in num_cols]
+
+print("\nDetected numeric columns:", num_cols)
+print("Detected categorical columns:", cat_cols if cat_cols else "None")
+
+# 4.7 Handle missing values in features
+#     Numeric -> median; Categorical -> mode
+for c in num_cols:
+    if X[c].isna().any():
+        X[c] = X[c].fillna(X[c].median())
+for c in cat_cols:
+    if X[c].isna().any():
+        X[c] = X[c].fillna(X[c].mode().iloc[0])
+
+# 4.8 Final sanity check
+print("\nAfter cleaning, total missing values in features:", X.isnull().sum().sum())
+
+#step 7 - EDA 
+
+# 5.1 Target Distribution
+plt.figure(figsize=(6, 4))
+sns.countplot(x=y, palette="pastel")
+plt.title("Target Distribution (0 = Legit, 1 = Phishing)")
+plt.xlabel("Target")
+plt.ylabel("Count")
+plt.show()
+
+# 5.2 Histograms for a few numeric columns
+cols_for_hist = num_cols[:4] if len(num_cols) >= 4 else num_cols
+if cols_for_hist:
+    X[cols_for_hist].hist(bins=30, figsize=(12, 6), color="#90caf9")
+    plt.suptitle("Feature Distributions (Histograms)")
+    plt.show()
+
+# 5.3 Boxplot of a numeric feature by target (pick the first numeric)
+if num_cols:
+    first_num = num_cols[0]
+    plt.figure(figsize=(6, 4))
+    sns.boxplot(x=y, y=X[first_num], palette="Set2")
+    plt.title(f"Boxplot of '{first_num}' by Target")
+    plt.xlabel("Target")
+    plt.ylabel(first_num)
+    plt.show()
+
+# 5.4 Scatter of first two numeric features (if >= 2)
+if len(num_cols) >= 2:
+    a, b = num_cols[0], num_cols[1]
+    # To keep it fast/clear visually, sample up to 10k points
+    scatter_sample = min(10000, len(X))
+    idx = np.random.RandomState(RANDOM_STATE).choice(X.index, scatter_sample, replace=False)
+    plt.figure(figsize=(7, 5))
+    sns.scatterplot(x=X.loc[idx, a], y=X.loc[idx, b], hue=y.loc[idx], alpha=0.4, palette="coolwarm")
+    plt.title(f"Scatter: {a} vs {b} (sampled)")
+    plt.show()
+
+# 5.5 Correlation Heatmap (numeric only)
+if len(num_cols) > 1:
+    corr = X[num_cols].corr()
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(corr, cmap="coolwarm", center=0, annot=False)
+    plt.title("Correlation Heatmap (Numeric Features)")
+    plt.show()
+
+
+#step 8 - train/test 
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.25, stratify=y, random_state=RANDOM_STATE
+)
+print("\nTrain/Test sizes:", X_train.shape, X_test.shape)
+
+
+#step 9 - modelling pipelines 
+
+# Preprocessor: scale numeric features; pass categorical as-is (if any)
+num_transformer = Pipeline(steps=[
+    ("scaler", StandardScaler(with_mean=True, with_std=True))
+])
+# If you had categorical columns, you could add OneHotEncoder here.
+preprocessor = ColumnTransformer(
+    transformers=[("num", num_transformer, num_cols)],
+    remainder="passthrough",  # keep any non-numeric as-is (none here)
+    verbose_feature_names_out=False
+)
+
+models = {
+    "LogReg": LogisticRegression(
+        max_iter=1000, class_weight="balanced", random_state=RANDOM_STATE, n_jobs=None, solver="saga"
+    ),
+    "RandomForest": RandomForestClassifier(
+        n_estimators=200, max_depth=None, n_jobs=-1, class_weight="balanced_subsample", random_state=RANDOM_STATE
+    ),
+    "GradBoost": GradientBoostingClassifier(random_state=RANDOM_STATE)  # no class_weight param available
+}
+
+pipelines = {
+    name: Pipeline(steps=[("prep", preprocessor), ("clf", est)]) for name, est in models.items()
+}
+
+#step 10- cross validation
+
+
+cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
+scoring = ["accuracy", "precision", "recall", "f1", "roc_auc"]
+
+cv_results = {}
+for name, pipe in pipelines.items():
+    print(f"\n⏳ Cross-validating: {name}")
+    res = cross_validate(pipe, X_train, y_train, cv=cv, scoring=scoring, n_jobs=-1)
+    summary = {metric: (res[f"test_{metric}"].mean(), res[f"test_{metric}"].std()) for metric in scoring}
+    cv_results[name] = summary
+    for metric, (m, s) in summary.items():
+        print(f"  {metric:>9}: {m:.4f} ± {s:.4f}")
+
+# Plot a simple model comparison chart
+def plot_model_scores(cv_results: Dict[str, Dict[str, Tuple[float, float]]], metric: str = "roc_auc"):
+    labels = list(cv_results.keys())
+    means = [cv_results[m][metric][0] for m in labels]
+    plt.figure(figsize=(7, 4))
+    sns.barplot(x=labels, y=means, palette="viridis")
+    plt.title(f"Model Comparison (CV mean {metric.upper()})")
+    plt.ylabel(metric.upper())
+    plt.ylim(0, 1)
+    for i, v in enumerate(means):
+        plt.text(i, v + 0.01, f"{v:.3f}", ha="center", fontsize=10)
+    plt.show()
+
+plot_model_scores(cv_results, metric="roc_auc")
+
+#step 11 - final training 
+
+best_model_name = max(cv_results.keys(), key=lambda k: cv_results[k]["roc_auc"][0])
+best_pipeline = pipelines[best_model_name]
+print(f"\n🏆 Best model by CV ROC-AUC: {best_model_name}")
+
+best_pipeline.fit(X_train, y_train)
+
+#step 12 - test set evaluation
+
+
+y_pred = best_pipeline.predict(X_test)
+# Some classifiers may not have predict_proba; handle gracefully
+if hasattr(best_pipeline.named_steps["clf"], "predict_proba"):
+    y_proba = best_pipeline.predict_proba(X_test)[:, 1]
+else:
+    # Fallback: decision_function -> probability-like by min-max scaling
+    if hasattr(best_pipeline.named_steps["clf"], "decision_function"):
+        scores = best_pipeline.named_steps["clf"].decision_function(X_test)
+        y_proba = (scores - scores.min()) / (scores.max() - scores.min() + 1e-9)
+    else:
+        y_proba = None
+
+print("Accuracy :", round(accuracy_score(y_test, y_pred), 4))
+print("Precision:", round(precision_score(y_test, y_pred, zero_division=0), 4))
+print("Recall   :", round(recall_score(y_test, y_pred, zero_division=0), 4))
+print("F1-Score :", round(f1_score(y_test, y_pred), 4))
+if y_proba is not None:
+    print("ROC-AUC  :", round(roc_auc_score(y_test, y_proba), 4))
+
+print("\nConfusion Matrix:")
+cm = confusion_matrix(y_test, y_pred)
+cm_df = pd.DataFrame(cm, index=["True:0", "True:1"], columns=["Pred:0", "Pred:1"])
+display(cm_df)
+
+print("\nClassification Report:")
+print(classification_report(y_test, y_pred, digits=4))
+
+if y_proba is not None:
+    RocCurveDisplay.from_predictions(y_test, y_proba)
+    plt.title(f"ROC Curve — {best_model_name}")
+    plt.show()
+
+#step 13 - feature importance 
+
+
+def plot_feature_importance(pipeline: Pipeline, feature_names: List[str], top_k: int = 15):
+    """Plot feature importances for tree-based models if available."""
+    clf = pipeline.named_steps["clf"]
+    if hasattr(clf, "feature_importances_"):
+        # ColumnTransformer may reorder columns; get output names:
+        try:
+            prep = pipeline.named_steps["prep"]
+            feature_out = prep.get_feature_names_out()
+        except Exception:
+            feature_out = feature_names
+        imp = pd.Series(clf.feature_importances_, index=feature_out).sort_values(ascending=False)
+        plt.figure(figsize=(8, 6))
+        imp.head(top_k).iloc[::-1].plot(kind="barh", color="#26a69a")
+        plt.title(f"Top {top_k} Feature Importances — {type(clf).__name__}")
+        plt.xlabel("Importance")
+        plt.tight_layout()
+        plt.show()
+        display(imp.head(top_k))
+    else:
+        print("ℹ️ Feature importance not available for this model.")
+
+plot_feature_importance(best_pipeline, X.columns.tolist(), top_k=15)
+
+
